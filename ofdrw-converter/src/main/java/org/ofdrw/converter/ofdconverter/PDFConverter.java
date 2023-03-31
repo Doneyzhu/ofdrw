@@ -1,5 +1,6 @@
 package org.ofdrw.converter.ofdconverter;
 
+import org.apache.pdfbox.cos.COSInputStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
@@ -9,25 +10,31 @@ import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDFileSpecification;
+import org.apache.pdfbox.pdmodel.interactive.action.PDActionGoTo;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationFileAttachment;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.*;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.ofdrw.converter.GeneralConvertException;
+import org.ofdrw.core.action.actionType.actionGoto.CT_Dest;
+import org.ofdrw.core.action.actionType.actionGoto.DestType;
 import org.ofdrw.core.attachment.CT_Attachment;
+import org.ofdrw.core.basicStructure.doc.bookmark.Bookmark;
+import org.ofdrw.core.basicStructure.doc.bookmark.Bookmarks;
+import org.ofdrw.core.basicType.ST_ID;
 import org.ofdrw.graphics2d.OFDGraphicsDocument;
 import org.ofdrw.graphics2d.OFDPageGraphics2D;
 
 import java.awt.*;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
-import java.util.Calendar;
-import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * PDF转换为OFD转换器
@@ -49,11 +56,34 @@ public class PDFConverter implements DocConverter {
     final OFDGraphicsDocument ofdDoc;
 
     /**
+     * 书签列表
+     */
+    private Bookmarks bookmarks;
+
+    /**
      * PDF坐标系 转换 OFD坐标系 缩放比例
      * PDF user unit / OFD mm
      * user unit per millimeter
      */
-    final double UUPMM = 2.8346;
+    double uuPmm = 2.8346;
+
+    /**
+     * 已经完成附件复制的文件绝对路径
+     * <p>
+     * 防止重复拷贝同一个文件中的附件
+     */
+    private final Set<String> copied;
+
+
+    /**
+     * 是否允许复制PDF的附件到OFD中
+     */
+    private boolean enableCopyAttachFiles;
+
+    /**
+     * 是否允许复制书签
+     */
+    private boolean enableCopyBookmarks;
 
     /**
      * 创建PDF转换OFD转换器
@@ -79,6 +109,10 @@ public class PDFConverter implements DocConverter {
             Files.createFile(ofdPath);
         }
         ofdDoc = new OFDGraphicsDocument(ofdPath);
+        copied = new HashSet<>();
+        enableCopyAttachFiles = true;
+        enableCopyBookmarks = true;
+        bookmarks = null;
     }
 
 
@@ -120,23 +154,175 @@ public class PDFConverter implements DocConverter {
             r.put(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             pdfRender.setRenderingHints(r);
 
+            PDDocumentOutline pdfOutline = pdfDoc.getDocumentCatalog().getDocumentOutline();
+
             for (Integer index : targetPages) {
                 PDRectangle pdfPageSize = pdfDoc.getPage(index).getBBox();
                 // 将PDF页面尺寸缩放至OFD尺寸
-                OFDPageGraphics2D ofdPageG2d = ofdDoc.newPage(pdfPageSize.getWidth() / UUPMM, pdfPageSize.getHeight() / UUPMM);
-                pdfRender.renderPageToGraphics(index, ofdPageG2d, (float) (1d / UUPMM));
-//                BufferedImage image = new BufferedImage((int) pdfPageSize.getWidth(), (int) pdfPageSize.getHeight(), BufferedImage.TYPE_INT_RGB);
+                OFDPageGraphics2D ofdPageG2d = ofdDoc.newPage(pdfPageSize.getWidth() / uuPmm, pdfPageSize.getHeight() / uuPmm);
+                pdfRender.renderPageToGraphics(index, ofdPageG2d, (float) (1d / uuPmm));
+                if (enableCopyBookmarks) {
+                    exportBookmark(pdfDoc, pdfOutline, ofdPageG2d.pageID, index);
+                }
+//                BufferedImage image = new BufferedImage((int) pdfPageSize.getWidth(), (int) pdfPageSize.getHeight(), BufferedImage.TYPE_INT_ARGB);
 //                Graphics2D g = image.createGraphics();
-//                g.setColor(Color.WHITE);
 //                pdfRender.renderPageToGraphics(index, g);
 //                Path path = Paths.get("target/" + index + ".png");
 //                ImageIO.write(image, "png", path.toFile());
-
             }
+
+            if (!enableCopyAttachFiles) {
+                return;
+            }
+            // 检查文件中的附件是否已经复制过
+            String srcFilePath = filepath.toAbsolutePath().toString();
+            if (copied.contains(srcFilePath)) {
+                return;
+            }
+            copied.add(srcFilePath);
             // 复制附件到OFD
             copyAttachFiles(pdfDoc, targetPages);
         } catch (IOException e) {
             throw new GeneralConvertException("PDF转换OFD异常", e);
+        }
+    }
+
+    /**
+     * 设置每毫米容纳多少个用户单元（PDF单位）
+     *
+     * @param uuPmm 每毫米用户单元数
+     */
+    public void setUUPMM(double uuPmm) {
+        this.uuPmm = uuPmm;
+    }
+
+    /**
+     * 启用或禁用PDF附件向OFD复制
+     *
+     * @param enableCopyAttachFiles true - 启用复制； false - 禁用复制；默认为true 复制
+     */
+    public void setEnableCopyAttachFiles(boolean enableCopyAttachFiles) {
+        this.enableCopyAttachFiles = enableCopyAttachFiles;
+    }
+
+    /**
+     * 启用或禁用PDF书签向OFD复制
+     *
+     * @param enableCopyBookmarks true - 启用复制； false - 禁用复制；默认为true 复制
+     */
+    public void setEnableCopyBookmarks(boolean enableCopyBookmarks) {
+        this.enableCopyBookmarks = enableCopyBookmarks;
+    }
+
+    /**
+     * 递归的遍历文档大纲并导出PDF书签
+     *
+     * @param pdfDoc      PDF文档对象
+     * @param bookmark    书签节点
+     * @param pageID      页面对象ID
+     * @param targetIndex 目标页面索引
+     * @throws IOException PDF解析异常
+     */
+    private void exportBookmark(PDDocument pdfDoc, PDOutlineNode bookmark, ST_ID pageID, int targetIndex) throws IOException {
+        if (bookmark == null) {
+            return;
+        }
+
+        PDOutlineItem current = bookmark.getFirstChild();
+        while (current != null) {
+
+            PDPageDestination pd = null;
+
+            // 获取页码信息
+            PDDestination destination = current.getDestination();
+            if (destination instanceof PDPageDestination) {
+                pd = (PDPageDestination) destination;
+            } else if (destination instanceof PDNamedDestination) {
+                pd = pdfDoc.getDocumentCatalog().findNamedDestinationPage((PDNamedDestination) destination);
+            }
+
+            if (current.getAction() instanceof PDActionGoTo) {
+                PDActionGoTo gta = (PDActionGoTo) current.getAction();
+                if (gta.getDestination() instanceof PDPageDestination) {
+                    pd = (PDPageDestination) gta.getDestination();
+                } else if (gta.getDestination() instanceof PDNamedDestination) {
+                    pd = pdfDoc.getDocumentCatalog().findNamedDestinationPage((PDNamedDestination) gta.getDestination());
+                }
+            }
+            // 根据书签目的地类型创建不同类型的书签
+            if (pd != null && pd.retrievePageNumber() == targetIndex) {
+                CT_Dest ctDest = null;
+                if (destination instanceof PDPageXYZDestination) {
+                    PDPageXYZDestination dst = (PDPageXYZDestination) destination;
+
+                    ctDest = new CT_Dest().setPageID(pageID.ref());
+                    ctDest.setType(DestType.XYZ);
+
+                    float left = dst.getLeft();
+                    if (left > 0) {
+                        ctDest.setLeft(left / uuPmm);
+                    }
+                    if (dst.getTop() > 0) {
+                        float top = dst.getPage().getBBox().getHeight() - dst.getTop();
+                        ctDest.setTop(top / uuPmm);
+                    }
+                    float zoom = dst.getZoom();
+                    if (zoom > 0) {
+                        ctDest.setZoom(zoom);
+                    }
+//                    System.out.println("Page: " + dst.retrievePageNumber() + " ZXY left: " + dst.getLeft() + " top:" + dst.getTop() + " zoom: " + dst.getZoom() + " title: " + current.getTitle());
+                } else if (destination instanceof PDPageFitHeightDestination) {
+                    PDPageFitHeightDestination dst = (PDPageFitHeightDestination) destination;
+                    ctDest = new CT_Dest().setPageID(pageID.ref());
+                    ctDest.setType(DestType.FitV);
+                    int left = dst.getLeft();
+                    if (left > 0) {
+                        ctDest.setLeft(left / uuPmm);
+                    }
+                } else if (destination instanceof PDPageFitWidthDestination) {
+                    PDPageFitWidthDestination dst = (PDPageFitWidthDestination) destination;
+                    ctDest = new CT_Dest().setPageID(pageID.ref());
+                    ctDest.setType(DestType.FitH);
+
+                    if (dst.getTop() > 0) {
+                        float top = dst.getPage().getBBox().getHeight() - dst.getTop();
+                        ctDest.setTop(top / uuPmm);
+                    }
+                } else if (destination instanceof PDPageFitRectangleDestination) {
+                    PDPageFitRectangleDestination dst = (PDPageFitRectangleDestination) destination;
+                    ctDest = new CT_Dest().setPageID(pageID.ref());
+                    ctDest.setType(DestType.FitR);
+                    float height = dst.getPage().getBBox().getHeight();
+
+                    int left = dst.getLeft();
+                    if (left > 0) {
+                        ctDest.setLeft(left / uuPmm);
+                    }
+                    if (dst.getTop() > 0) {
+                        float top = height - dst.getTop();
+                        ctDest.setTop(top / uuPmm);
+                    }
+                    int right = dst.getRight();
+                    if (right > 0) {
+                        ctDest.setRight(right);
+                    }
+                    if (dst.getBottom() > 0) {
+                        float bottom = height - dst.getBottom();
+                        ctDest.setTop(bottom / uuPmm);
+                    }
+                }
+                if (ctDest != null) {
+                    if (bookmarks == null) {
+                        bookmarks = new Bookmarks();
+                        ofdDoc.document.setBookmarks(bookmarks);
+                    }
+                    // 添加书签
+                    bookmarks.addBookmark(new Bookmark(current.getTitle(), ctDest));
+                }
+            }
+
+            exportBookmark(pdfDoc, current, pageID, targetIndex);
+            current = current.getNextSibling();
         }
     }
 
@@ -149,7 +335,7 @@ public class PDFConverter implements DocConverter {
      * @param targetPages 目标页面
      * @throws IOException 文件复制异常
      */
-    public void copyAttachFiles(PDDocument document, List<Integer> targetPages) throws IOException {
+    private void copyAttachFiles(PDDocument document, List<Integer> targetPages) throws IOException {
         PDDocumentNameDictionary namesDictionary = new PDDocumentNameDictionary(document.getDocumentCatalog());
         // 从全局获取文档附件
         PDEmbeddedFilesNameTreeNode efTree = namesDictionary.getEmbeddedFiles();
@@ -244,9 +430,10 @@ public class PDFConverter implements DocConverter {
             attObj.setCreationDate(LocalDateTime.ofInstant(modDate.toInstant(), modDate.getTimeZone().toZoneId()));
         }
         attObj.setFormat(subtype);
-        InputStream input = new ByteArrayInputStream(embeddedFile.toByteArray());
-        ofdDoc.addAttachment(attObj, input);
-        input.close();
+
+        try (COSInputStream inputStream = embeddedFile.createInputStream()) {
+            ofdDoc.addAttachment(attObj, inputStream);
+        }
     }
 
 
